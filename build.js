@@ -16,6 +16,15 @@ function cp(src, dest) {
   fs.copyFileSync(src, dest);
 }
 
+// Stamp the build so the popup can display exactly which build is loaded
+function writeBuildInfo(dest, target) {
+  const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  fs.writeFileSync(
+    path.join(dest, 'popup', 'build-info.js'),
+    `window.__AM_BUILD__ = '${target} ${stamp}';\n`
+  );
+}
+
 function cpDir(srcDir, destDir) {
   if (!fs.existsSync(srcDir)) return;
   fs.mkdirSync(destDir, { recursive: true });
@@ -57,6 +66,7 @@ function buildChrome() {
   const ffBg = path.join(dest, 'background', 'background-page.js');
   if (fs.existsSync(ffBg)) fs.rmSync(ffBg);
 
+  writeBuildInfo(dest, 'chrome');
   console.log('✓ Chrome build → dist/chrome/');
 }
 
@@ -86,6 +96,7 @@ function buildFirefox() {
     if (fs.existsSync(p)) fs.rmSync(p);
   }
 
+  writeBuildInfo(dest, 'firefox');
   console.log('✓ Firefox build → dist/firefox/');
 }
 

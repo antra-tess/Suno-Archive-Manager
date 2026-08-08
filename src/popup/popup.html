@@ -28,12 +28,12 @@
       <div class="logo-icon small">♪</div>
       <h1 class="app-title small">SAM</h1>
     </div>
-    <p class="hint-text center">Scans your library at <strong>suno.com/me</strong> or any <strong>suno.com/playlist/</strong> page. Navigate there first, or click below to go to your library.</p>
-    <button id="btn-start-scan" class="btn-primary">Scan Library</button>
+    <p class="hint-text center">Songs are captured automatically as you browse — open your <strong>library</strong> or any <strong>playlist</strong> and everything the page loads is added to the archive. Use the scan below to auto-scroll a long page to the bottom.</p>
+    <button id="btn-start-scan" class="btn-primary">Scan This Page</button>
     <div id="ready-resume" class="resume-area hidden">
-      <p class="hint-text center">Previous scan: <strong id="resume-count">0</strong> songs indexed.</p>
-      <button id="btn-resume-export" class="btn-secondary">Download ZIP from Previous Scan</button>
-      <button id="btn-clear-scan" class="btn-ghost">Clear &amp; Start Fresh</button>
+      <p class="hint-text center"><strong id="resume-count">0</strong> songs captured so far.</p>
+      <button id="btn-resume-export" class="btn-secondary">Download ZIP</button>
+      <button id="btn-clear-scan" class="btn-ghost">Clear Archive</button>
     </div>
   </div>
 
@@ -75,9 +75,13 @@
     </div>
 
     <button id="btn-download-zip" class="btn-primary full">Download ZIP</button>
-    <button id="btn-scan-again" class="btn-ghost">Scan Again</button>
+    <button id="btn-download-json" class="btn-secondary full">Metadata Only (JSON)</button>
+    <button id="btn-scan-again" class="btn-ghost">Add More Songs</button>
   </div>
 
+  <p id="build-info" class="hint-text center" style="margin-top:14px;opacity:.55;font-size:11px;"></p>
+
+  <script src="build-info.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>
