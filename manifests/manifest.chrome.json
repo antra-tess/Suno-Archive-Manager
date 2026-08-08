@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SAM - Suno Archive Manager",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Scan and download your entire Suno music library as a local ZIP.",
   "icons": {
     "16":  "icons/icon16.png",

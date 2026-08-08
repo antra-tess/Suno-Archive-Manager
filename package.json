@@ -1,6 +1,6 @@
 {
   "name": "archive-master-extension",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Browser extension to scan and download your Suno music library",
   "scripts": {
     "build:chrome": "node build.js chrome",
