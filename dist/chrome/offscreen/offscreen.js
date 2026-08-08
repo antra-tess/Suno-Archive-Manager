@@ -35,20 +35,101 @@ function detectCoverMime(buffer) {
   return 'image/jpeg';
 }
 
+// Song metadata as written to metadata.json / the JSON-only export.
+// Shared by both export paths so the two can't drift apart.
+function metadataEntry(song) {
+  return {
+    id:           song.id,
+    title:        song.title,
+    display_name: song.display_name || '',
+    handle:       song.handle ?? null,
+    user_id:      song.user_id ?? null,
+    avatar_url:   song.avatar_url ?? null,
+    tags:         song.tags || '',
+    prompt:       song.prompt || '',
+    created_at:   song.created_at || '',
+    model_name:    song.model_name ?? null,
+    model_version: song.model_version ?? null,
+    play_count:   song.play_count ?? null,
+    upvote_count: song.upvote_count ?? null,
+    is_liked:     song.is_liked ?? null,
+    is_public:    song.is_public ?? null,
+    playlists:    song.playlists || [],
+    audio_url:    song.audio_url,
+    image_url:    song.image_url || '',
+  };
+}
+
+// Metadata-only export: no audio/cover fetching, single small JSON file.
+function exportMetadata(songs) {
+  const dateStr = new Date().toISOString().split('T')[0];
+  const json = JSON.stringify(songs.map(metadataEntry), null, 2);
+  const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+  chrome.runtime.sendMessage({
+    type: 'ZIP_READY', url, filename: `SAM_metadata_${dateStr}.json`, part: 1, final: true,
+  });
+  setTimeout(() => URL.revokeObjectURL(url), 120000);
+}
+
+// Cap each ZIP part at ~500MB of fetched content. Building everything into a
+// single archive means JSZip holds the whole library in memory and dies with a
+// RangeError ("invalid array length") somewhere past ~2GB. Parts keep peak
+// memory bounded regardless of library size.
+const CHUNK_BYTES = 500 * 1024 * 1024;
+
 async function assembleZip(songs) {
-  const zip = new JSZip();
   const dateStr = new Date().toISOString().split('T')[0];
   const folderName = `SAM_${dateStr}`;
-  const root        = zip.folder(folderName);
-  const audioFolder = root.folder('audio');
-  const coversFolder = root.folder('covers');
-
-  const metadata = [];
   const total = songs.length;
+
+  let part = 1;
+  let zip, root, audioFolder, coversFolder, metadata, partBytes;
+
+  function newPart() {
+    zip          = new JSZip();
+    root         = zip.folder(folderName);
+    audioFolder  = root.folder('audio');
+    coversFolder = root.folder('covers');
+    metadata     = [];
+    partBytes    = 0;
+  }
+
+  // Generate the current part and hand it to the service worker for download.
+  // Each part carries a metadata.json for its own songs, so every part is
+  // self-contained even if a later part fails.
+  async function flushPart(isFinal, fetchPercent) {
+    root.file('metadata.json', JSON.stringify(metadata, null, 2));
+
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' }, (meta) => {
+      chrome.runtime.sendMessage({
+        type: 'ZIP_PROGRESS',
+        percent: isFinal ? 90 + Math.round(meta.percent * 0.1) : fetchPercent,
+        label: `Building ZIP part ${part}… ${Math.round(meta.percent)}%`,
+      });
+    });
+
+    // A single-part export keeps the plain name; parts only appear when the
+    // size cap was actually hit.
+    const suffix   = (isFinal && part === 1) ? '' : `_part${part}`;
+    const url      = URL.createObjectURL(blob);
+    const filename = `SAM_${dateStr}${suffix}.zip`;
+    chrome.runtime.sendMessage({ type: 'ZIP_READY', url, filename, part, final: isFinal });
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+
+    part++;
+    newPart(); // drop references so the finished part's buffers can be GC'd
+  }
+
+  newPart();
 
   for (let i = 0; i < songs.length; i++) {
     const song = songs[i];
-    chrome.runtime.sendMessage({ type: 'ZIP_PROGRESS', percent: Math.round((i / total) * 90), current: i, total });
+    chrome.runtime.sendMessage({
+      type: 'ZIP_PROGRESS',
+      percent: Math.round((i / total) * 90),
+      current: i, total,
+      label: `Fetching files… ${i} / ${total}`,
+    });
 
     const ext      = getExtension(song.audio_url);
     const safeName = sanitizeFilename(song.title) + '_' + song.id.slice(0, 8);
@@ -65,6 +146,7 @@ async function assembleZip(songs) {
           coverBuffer = await r.arrayBuffer();
           coverMime   = detectCoverMime(coverBuffer);
           coversFolder.file(coverFilename, coverBuffer);
+          partBytes += coverBuffer.byteLength;
         }
       } catch (e) {
         console.warn('[AM] Cover fetch failed:', song.id, e.message);
@@ -110,6 +192,7 @@ async function assembleZip(songs) {
           }
 
           audioFolder.file(audioFilename, audioBuffer);
+          partBytes += audioBuffer.byteLength;
         }
       } catch (e) {
         console.warn('[AM] Audio fetch failed:', song.id, e.message);
@@ -117,35 +200,17 @@ async function assembleZip(songs) {
     }
 
     metadata.push({
-      id:           song.id,
-      title:        song.title,
-      display_name: song.display_name || '',
-      audio_file:   `audio/${audioFilename}`,
-      cover_file:   song.image_url ? `covers/${coverFilename}` : null,
-      tags:         song.tags || '',
-      prompt:       song.prompt || '',
-      created_at:   song.created_at || '',
-      audio_url:    song.audio_url,
-      image_url:    song.image_url || '',
+      ...metadataEntry(song),
+      audio_file: `audio/${audioFilename}`,
+      cover_file: song.image_url ? `covers/${coverFilename}` : null,
     });
+
+    if (partBytes >= CHUNK_BYTES && i < songs.length - 1) {
+      await flushPart(false, Math.round((i / total) * 90));
+    }
   }
 
-  root.file('metadata.json', JSON.stringify(metadata, null, 2));
-
-  chrome.runtime.sendMessage({ type: 'ZIP_PROGRESS', percent: 95, current: total, total });
-
-  const blob = await zip.generateAsync({ type: 'blob' }, (meta) => {
-    chrome.runtime.sendMessage({
-      type: 'ZIP_PROGRESS',
-      percent: 95 + Math.round(meta.percent * 0.05),
-      current: total, total,
-    });
-  });
-
-  const url      = URL.createObjectURL(blob);
-  const filename = `SAM_${dateStr}.zip`;
-  chrome.runtime.sendMessage({ type: 'ZIP_READY', url, filename });
-  setTimeout(() => URL.revokeObjectURL(url), 120000);
+  await flushPart(true, 90);
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
@@ -154,5 +219,12 @@ chrome.runtime.onMessage.addListener((msg) => {
       console.error('[AM Offscreen] ZIP error:', err);
       chrome.runtime.sendMessage({ type: 'ZIP_ERROR', message: String(err) });
     });
+  } else if (msg.type === 'ASSEMBLE_METADATA') {
+    try {
+      exportMetadata(msg.songs);
+    } catch (err) {
+      console.error('[AM Offscreen] Metadata export error:', err);
+      chrome.runtime.sendMessage({ type: 'ZIP_ERROR', message: String(err) });
+    }
   }
 });

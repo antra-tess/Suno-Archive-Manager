@@ -41,23 +41,44 @@ function notifyPopup(msg) {
   chrome.runtime.sendMessage(msg).catch(() => {});
 }
 
+// ── Toolbar badge = captured song count ───────────────────────────────────
+function updateBadge(count) {
+  chrome.action.setBadgeText({ text: count > 0 ? String(count) : '' }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ color: '#7c3aed' }).catch(() => {});
+}
+
+// Restore badge after service-worker restarts
+getSongs().then(songs => updateBadge(songs.length)).catch(() => {});
+
 // ── Message handler ────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === 'ADD_SONGS') {
         const existing = await getSongs();
-        const idSet = new Set(existing.map(s => s.id));
-        const added = [];
+        const byId = new Map(existing.map(s => [s.id, s]));
+        let changed = false;
         for (const s of msg.songs) {
-          if (!idSet.has(s.id)) {
-            idSet.add(s.id);
-            added.push(s);
+          const cur = byId.get(s.id);
+          if (!cur) {
+            byId.set(s.id, s);
+            existing.push(s);
+            changed = true;
+          } else if (Array.isArray(s.playlists) && s.playlists.length) {
+            // Known song re-seen inside a playlist — merge the attribution
+            cur.playlists = cur.playlists || [];
+            for (const p of s.playlists) {
+              if (!cur.playlists.some(q => q.id === p.id)) {
+                cur.playlists.push(p);
+                changed = true;
+              }
+            }
           }
         }
-        if (added.length > 0) {
-          await saveSongs([...existing, ...added]);
-          notifyPopup({ type: 'SONGS_UPDATED', count: existing.length + added.length });
+        if (changed) {
+          await saveSongs(existing);
+          notifyPopup({ type: 'SONGS_UPDATED', count: existing.length });
+          updateBadge(existing.length);
         }
         sendResponse({ ok: true });
 
@@ -67,6 +88,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
       } else if (msg.type === 'CLEAR_SONGS') {
         await saveSongs([]);
+        updateBadge(0);
         sendResponse({ ok: true });
 
       } else if (msg.type === 'SCROLL_COMPLETE') {
@@ -83,6 +105,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         chrome.runtime.sendMessage({ type: 'ASSEMBLE_ZIP', songs });
         sendResponse({ ok: true });
 
+      } else if (msg.type === 'EXPORT_METADATA') {
+        const songs = await getSongs();
+        if (songs.length === 0) {
+          sendResponse({ error: 'No songs to export' });
+          return;
+        }
+        await ensureOffscreen();
+        chrome.runtime.sendMessage({ type: 'ASSEMBLE_METADATA', songs }).catch(() => {});
+        sendResponse({ ok: true });
+
       } else if (msg.type === 'ZIP_PROGRESS') {
         notifyPopup(msg);
         sendResponse({ ok: true });
@@ -94,7 +126,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           filename: msg.filename,
           saveAs: false,
         });
-        notifyPopup({ type: 'ZIP_DOWNLOAD_STARTED' });
+        notifyPopup({ type: 'ZIP_DOWNLOAD_STARTED', part: msg.part, final: msg.final !== false });
         sendResponse({ ok: true });
 
       } else if (msg.type === 'ZIP_ERROR') {

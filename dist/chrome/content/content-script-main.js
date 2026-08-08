@@ -11,7 +11,10 @@
   // or re-attaching, otherwise wrapping window.fetch again causes infinite recursion.
   const trueFetch = window.fetch;
 
-  let capturedIds = new Set();
+  // Dedup on (song id, playlist id) pairs — a song already sent without
+  // playlist context must be re-sent when it later shows up inside a
+  // playlist, so the background can merge the attribution.
+  let sentKeys = new Set();
 
   // ── Helpers ──────────────────────────────────────────────────────────────
   function findSongs(obj) {
@@ -30,6 +33,21 @@
     return found;
   }
 
+  // Find playlist containers (objects wrapping a playlist_clips array) so
+  // songs can be attributed to the playlist they were captured from.
+  function findPlaylists(obj, out) {
+    out = out || [];
+    if (!obj || typeof obj !== 'object') return out;
+    if (Array.isArray(obj)) { obj.forEach(i => findPlaylists(i, out)); return out; }
+    if (obj.id && Array.isArray(obj.playlist_clips)) {
+      out.push({ id: obj.id, name: obj.name || obj.title || '', clips: obj.playlist_clips });
+    }
+    Object.keys(obj).forEach(k => {
+      if (k !== 'metadata' && typeof obj[k] === 'object') findPlaylists(obj[k], out);
+    });
+    return out;
+  }
+
   function normalizeSong(raw) {
     return {
       id:           raw.id,
@@ -41,6 +59,15 @@
       created_at:   raw.created_at || '',
       display_name: raw.display_name || raw.user_display_name ||
                     raw.profiles?.display_name || raw.handle || '',
+      handle:       raw.handle ?? raw.profiles?.handle ?? null,
+      user_id:      raw.user_id ?? null,
+      avatar_url:   raw.avatar_image_url ?? raw.profiles?.avatar_image_url ?? null,
+      model_name:   raw.model_name ?? raw.metadata?.model_name ?? null,
+      model_version: raw.major_model_version ?? raw.metadata?.major_model_version ?? null,
+      play_count:   raw.play_count   ?? raw.metadata?.play_count   ?? raw.stats?.play_count   ?? null,
+      upvote_count: raw.upvote_count ?? raw.metadata?.upvote_count ?? raw.stats?.upvote_count ?? null,
+      is_liked:     raw.is_liked     ?? raw.reaction?.is_liked     ?? null,
+      is_public:    raw.is_public    ?? raw.metadata?.is_public    ?? null,
     };
   }
 
@@ -68,12 +95,26 @@
         response.clone().json().then(data => {
           const raw = findSongs(data);
           if (!raw.length) return;
+
+          // Map song id → playlist it appeared under (if any)
+          const playlistOf = new Map();
+          for (const pl of findPlaylists(data)) {
+            for (const entry of pl.clips) {
+              const clip = entry && (entry.clip || entry);
+              if (clip && clip.id) playlistOf.set(clip.id, { id: pl.id, name: pl.name });
+            }
+          }
+
           const newSongs = [];
           for (const r of raw) {
-            if (r.id && !capturedIds.has(r.id)) {
-              capturedIds.add(r.id);
-              newSongs.push(normalizeSong(r));
-            }
+            if (!r.id) continue;
+            const pl = playlistOf.get(r.id) || null;
+            const key = r.id + '|' + (pl ? pl.id : '');
+            if (sentKeys.has(key)) continue;
+            sentKeys.add(key);
+            const song = normalizeSong(r);
+            song.playlists = pl ? [pl] : [];
+            newSongs.push(song);
           }
           if (newSongs.length) {
             lastSongArrival = Date.now();

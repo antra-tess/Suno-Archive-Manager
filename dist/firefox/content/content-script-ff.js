@@ -30,6 +30,20 @@ const pageScript = `
     return found;
   }
 
+  // Find playlist containers so songs can be attributed to their playlist
+  function findPlaylists(obj, out) {
+    out = out || [];
+    if (!obj || typeof obj !== 'object') return out;
+    if (Array.isArray(obj)) { obj.forEach(function(i) { findPlaylists(i, out); }); return out; }
+    if (obj.id && Array.isArray(obj.playlist_clips)) {
+      out.push({ id: obj.id, name: obj.name || obj.title || '', clips: obj.playlist_clips });
+    }
+    Object.keys(obj).forEach(function(k) {
+      if (k !== 'metadata' && typeof obj[k] === 'object') findPlaylists(obj[k], out);
+    });
+    return out;
+  }
+
   function normalizeSong(raw) {
     var audioUrl = raw.audio_url || (raw.metadata && raw.metadata.audio_url) || '';
     var imageUrl = raw.image_url || raw.image_large_url || (raw.metadata && raw.metadata.image_url) || '';
@@ -41,13 +55,39 @@ const pageScript = `
       tags: (raw.metadata && raw.metadata.tags) || raw.tags || '',
       prompt: (raw.metadata && raw.metadata.prompt) || raw.prompt || '',
       created_at: raw.created_at || '',
+      display_name: raw.display_name || raw.user_display_name ||
+                    (raw.profiles && raw.profiles.display_name) || raw.handle || '',
+      handle:       firstDefined(raw.handle, raw.profiles && raw.profiles.handle),
+      user_id:      firstDefined(raw.user_id),
+      avatar_url:   firstDefined(raw.avatar_image_url, raw.profiles && raw.profiles.avatar_image_url),
+      model_name:    firstDefined(raw.model_name, raw.metadata && raw.metadata.model_name),
+      model_version: firstDefined(raw.major_model_version, raw.metadata && raw.metadata.major_model_version),
+      play_count:   firstDefined(raw.play_count,   raw.metadata && raw.metadata.play_count,   raw.stats && raw.stats.play_count),
+      upvote_count: firstDefined(raw.upvote_count, raw.metadata && raw.metadata.upvote_count, raw.stats && raw.stats.upvote_count),
+      is_liked:     firstDefined(raw.is_liked,     raw.reaction && raw.reaction.is_liked),
+      is_public:    firstDefined(raw.is_public,    raw.metadata && raw.metadata.is_public),
     };
   }
 
-  var capturedIds = new Set();
+  function firstDefined() {
+    for (var i = 0; i < arguments.length; i++) {
+      if (arguments[i] !== undefined && arguments[i] !== null) return arguments[i];
+    }
+    return null;
+  }
+
+  // Dedup on (song id, playlist id) pairs — a song already sent without
+  // playlist context is re-sent when it shows up inside a playlist, so the
+  // background can merge the attribution.
+  var sentKeys = new Set();
+
+  // Capture the true original fetch ONCE. attachInterceptor() is re-run on
+  // every SPA navigation; re-reading window.fetch there would wrap our own
+  // wrapper again and again, stacking one layer per navigation.
+  var trueFetch = window.fetch;
 
   function attachInterceptor() {
-    var originalFetch = window.fetch;
+    var originalFetch = trueFetch;
     window.fetch = function() {
       var args = Array.prototype.slice.call(arguments);
       var resource = args[0];
@@ -62,12 +102,25 @@ const pageScript = `
         clone.json().then(function(data) {
           var raw = findSongs(data);
           if (raw.length === 0) return;
+
+          var playlistOf = new Map();
+          findPlaylists(data).forEach(function(pl) {
+            pl.clips.forEach(function(entry) {
+              var clip = entry && (entry.clip || entry);
+              if (clip && clip.id) playlistOf.set(clip.id, { id: pl.id, name: pl.name });
+            });
+          });
+
           var newSongs = [];
           raw.forEach(function(r) {
-            if (r.id && !capturedIds.has(r.id)) {
-              capturedIds.add(r.id);
-              newSongs.push(normalizeSong(r));
-            }
+            if (!r.id) return;
+            var pl = playlistOf.get(r.id) || null;
+            var key = r.id + '|' + (pl ? pl.id : '');
+            if (sentKeys.has(key)) return;
+            sentKeys.add(key);
+            var song = normalizeSong(r);
+            song.playlists = pl ? [pl] : [];
+            newSongs.push(song);
           });
           if (newSongs.length > 0) {
             window.dispatchEvent(new CustomEvent('__AM_SONGS__', {

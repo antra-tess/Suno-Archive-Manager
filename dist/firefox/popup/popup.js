@@ -8,16 +8,8 @@ let pollInterval = null;
 let scrollCompleteTimer = null;
 let waitingForLibraryLoad = false;
 
-function isAllowedScanPage(url) {
-  return /suno\.com\/(me|library|playlist\/)/i.test(url);
-}
-
-function isPlaylistPage(url) {
-  return /suno\.com\/playlist\//i.test(url);
-}
-
-function isLibraryPage(url) {
-  return /suno\.com\/(me|library)/i.test(url);
+function isSunoPage(url) {
+  return /^https:\/\/[^/]*\.?suno\.(com|ai)/.test(url || '');
 }
 
 const views = {
@@ -45,6 +37,7 @@ const el = {
   zipProgressBar:  document.getElementById('zip-progress-bar'),
   zipStatusText:   document.getElementById('zip-status-text'),
   btnDownloadZip:  document.getElementById('btn-download-zip'),
+  btnDownloadJson: document.getElementById('btn-download-json'),
   btnScanAgain:    document.getElementById('btn-scan-again'),
 };
 
@@ -100,21 +93,21 @@ function stopPolling() {
 
 // ── Scan lifecycle ────────────────────────────────────────────────────────
 async function startScan() {
-  await msgBg({ type: 'CLEAR_SONGS' });
+  // Additive: existing captures are kept, so multiple pages/playlists can be
+  // combined into one export. Clearing is explicit via the Clear button.
+  const resp = await msgBg({ type: 'GET_SONGS' });
   el.scanLog.innerHTML = '';
-  el.scanCount.textContent = '0';
+  el.scanCount.textContent = String(resp?.songs?.length ?? 0);
   el.scanLabel.textContent = 'Loading…';
   isPaused = false;
   el.btnPause.textContent = 'Pause';
   showView('scanning');
 
-  // Always do a fresh navigation so document_start fires and the fetch
-  // interceptor catches every API call from the very first request.
-  // For playlist pages we reload the same URL; otherwise go to /me.
+  // Refresh the CURRENT page (never navigate away) so document_start fires
+  // and the fetch interceptor catches every API call from the very first
+  // request. Falls back to /me only if we somehow have no suno tab.
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const targetUrl = isPlaylistPage(tab?.url) ? tab.url
-                  : isLibraryPage(tab?.url)  ? tab.url
-                  : 'https://suno.com/me';
+  const targetUrl = isSunoPage(tab?.url) ? tab.url : 'https://suno.com/me';
 
   appendLog('Loading page…');
   waitingForLibraryLoad = true;
@@ -165,10 +158,30 @@ async function startZipDownload() {
   }
 }
 
+// ── Metadata-only download ────────────────────────────────────────────────
+async function startJsonDownload() {
+  el.btnDownloadJson.disabled = true;
+  el.zipProgressArea.classList.remove('hidden');
+  el.zipProgressBar.style.width = '50%';
+  el.zipStatusText.textContent = 'Preparing metadata…';
+
+  const resp = await msgBg({ type: 'EXPORT_METADATA' });
+  if (resp?.error) {
+    el.zipStatusText.textContent = 'Error: ' + resp.error;
+    el.btnDownloadJson.disabled = false;
+  }
+}
+
 // ── Background message listener ───────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'SONGS_UPDATED' && state === 'scanning') {
-    el.scanCount.textContent = msg.count;
+  if (msg.type === 'SONGS_UPDATED') {
+    if (state === 'scanning') {
+      el.scanCount.textContent = msg.count;
+    } else if (state === 'ready') {
+      // Passive capture while browsing — keep the ready view's count live
+      el.resumeCount.textContent = msg.count;
+      el.readyResume.classList.toggle('hidden', !(msg.count > 0));
+    }
   }
 
   if (msg.type === 'SCROLL_COMPLETE' && state === 'scanning') {
@@ -181,17 +194,27 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'ZIP_PROGRESS' && state === 'done') {
     const pct = Math.min(100, msg.percent ?? 0);
     el.zipProgressBar.style.width = pct + '%';
-    el.zipStatusText.textContent = msg.total
-      ? `Fetching files… ${msg.current ?? 0} / ${msg.total}`
-      : `Building ZIP… ${pct}%`;
+    el.zipStatusText.textContent = msg.label
+      ? msg.label
+      : msg.total
+        ? `Fetching files… ${msg.current ?? 0} / ${msg.total}`
+        : `Building ZIP… ${pct}%`;
   }
 
   if (msg.type === 'ZIP_DOWNLOAD_STARTED') {
-    el.zipProgressBar.style.width = '100%';
-    el.zipProgressBar.classList.remove('active');
-    el.zipStatusText.textContent = 'Download started!';
-    el.btnDownloadZip.textContent = 'Download ZIP';
-    el.btnDownloadZip.disabled = false;
+    if (msg.final === false) {
+      // Intermediate part of a chunked export — keep the progress UI running
+      el.zipStatusText.textContent = `Part ${msg.part} saved — continuing…`;
+    } else {
+      el.zipProgressBar.style.width = '100%';
+      el.zipProgressBar.classList.remove('active');
+      el.zipStatusText.textContent = msg.part > 1
+        ? `Download complete — ${msg.part} ZIP parts saved!`
+        : 'Download started!';
+      el.btnDownloadZip.textContent = 'Download ZIP';
+      el.btnDownloadZip.disabled = false;
+      el.btnDownloadJson.disabled = false;
+    }
   }
 
   if (msg.type === 'ZIP_ERROR') {
@@ -199,6 +222,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     el.zipStatusText.textContent = 'Error: ' + (msg.message || 'unknown error');
     el.btnDownloadZip.disabled = false;
     el.btnDownloadZip.textContent = 'Retry Download';
+    el.btnDownloadJson.disabled = false;
   }
 });
 
@@ -206,7 +230,7 @@ chrome.runtime.onMessage.addListener((msg) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (tabId !== activeTabId || changeInfo.status !== 'complete') return;
 
-  if (waitingForLibraryLoad && isAllowedScanPage(tab.url)) {
+  if (waitingForLibraryLoad && isSunoPage(tab.url)) {
     waitingForLibraryLoad = false;
     beginScroll();
     return;
@@ -263,9 +287,11 @@ el.btnPause.addEventListener('click', async () => {
 
 el.btnStopExport.addEventListener('click', stopAndShowDone);
 el.btnDownloadZip.addEventListener('click', startZipDownload);
+el.btnDownloadJson.addEventListener('click', startJsonDownload);
 
-el.btnScanAgain.addEventListener('click', async () => {
-  await msgBg({ type: 'CLEAR_SONGS' });
+el.btnScanAgain.addEventListener('click', () => {
+  // Back to ready without clearing — browse/scan more pages, then export
+  // everything together. Clearing is explicit via the Clear button.
   init();
 });
 
@@ -275,8 +301,7 @@ async function init() {
   if (!tab) { showView('offsite'); return; }
 
   activeTabId = tab.id;
-  const onSuno = /^https:\/\/[^/]*\.?suno\.(com|ai)/.test(tab.url || '');
-  if (!onSuno) { showView('offsite'); return; }
+  if (!isSunoPage(tab.url)) { showView('offsite'); return; }
 
   const resp = await msgBg({ type: 'GET_SONGS' });
   const existingCount = resp?.songs?.length ?? 0;
@@ -290,5 +315,10 @@ async function init() {
     el.readyResume.classList.add('hidden');
   }
 }
+
+// Version + build stamp — always visible so you can tell which build is loaded.
+// build-info.js is generated by build.js; missing (e.g. loading src/ directly) → "dev".
+document.getElementById('build-info').textContent =
+  `SAM v${chrome.runtime.getManifest().version} · build ${window.__AM_BUILD__ || 'dev'}`;
 
 init();
