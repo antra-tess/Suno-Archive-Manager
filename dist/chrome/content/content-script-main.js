@@ -16,6 +16,10 @@
   // playlist, so the background can merge the attribution.
   let sentKeys = new Set();
 
+  // Every playlist/project id → name we've ever seen (listings included).
+  // Used to attribute container-less feed responses by request context.
+  const knownPlaylists = new Map();
+
   // ── Helpers ──────────────────────────────────────────────────────────────
   function findSongs(obj) {
     let found = [];
@@ -33,14 +37,19 @@
     return found;
   }
 
-  // Find playlist containers (objects wrapping a playlist_clips array) so
-  // songs can be attributed to the playlist they were captured from.
+  // Find playlist/project containers so songs can be attributed to the
+  // collection they were captured from. Suno uses `playlist_clips` on
+  // playlist endpoints and `project_clips` on project endpoints (the newer
+  // name for library collections).
   function findPlaylists(obj, out) {
     out = out || [];
     if (!obj || typeof obj !== 'object') return out;
     if (Array.isArray(obj)) { obj.forEach(i => findPlaylists(i, out)); return out; }
-    if (obj.id && Array.isArray(obj.playlist_clips)) {
-      out.push({ id: obj.id, name: obj.name || obj.title || '', clips: obj.playlist_clips });
+    const clips = Array.isArray(obj.playlist_clips) ? obj.playlist_clips
+                : Array.isArray(obj.project_clips)  ? obj.project_clips
+                : null;
+    if (obj.id && clips) {
+      out.push({ id: obj.id, name: obj.name || obj.title || '', clips });
     }
     Object.keys(obj).forEach(k => {
       if (k !== 'metadata' && typeof obj[k] === 'object') findPlaylists(obj[k], out);
@@ -67,7 +76,11 @@
       play_count:   raw.play_count   ?? raw.metadata?.play_count   ?? raw.stats?.play_count   ?? null,
       upvote_count: raw.upvote_count ?? raw.metadata?.upvote_count ?? raw.stats?.upvote_count ?? null,
       is_liked:     raw.is_liked     ?? raw.reaction?.is_liked     ?? null,
+      is_disliked:  raw.is_disliked  ?? raw.reaction?.is_disliked  ?? null,
       is_public:    raw.is_public    ?? raw.metadata?.is_public    ?? null,
+      cover_clip_id:  raw.metadata?.cover_clip_id ?? raw.cover_clip_id ?? null,
+      history:        raw.metadata?.history        ?? null,
+      concat_history: raw.metadata?.concat_history ?? null,
     };
   }
 
@@ -83,32 +96,72 @@
   // ── Fetch interceptor ────────────────────────────────────────────────────
   function attachInterceptor() {
     window.fetch = async function (...args) {
-      const [resource] = args;
+      const [resource, init] = args;
       const url = resource instanceof Request ? resource.url : String(resource);
 
       if (/(statsig|segment|stratovibe|sentry|rgstr|pixel)/i.test(url)) {
         return new Response('{}', { status: 200 });
       }
 
+      // Snapshot the request body BEFORE the request is consumed — needed to
+      // attribute container-less feed responses to the playlist they belong to.
+      let reqTextPromise = Promise.resolve('');
+      try {
+        if (init && typeof init.body === 'string') {
+          reqTextPromise = Promise.resolve(init.body);
+        } else if (resource instanceof Request && resource.method !== 'GET') {
+          reqTextPromise = resource.clone().text().catch(() => '');
+        }
+      } catch (e) { /* opaque body — ignore */ }
+
       try {
         const response = await trueFetch.apply(this, args);
-        response.clone().json().then(data => {
+        response.clone().json().then(async data => {
+          // Register every playlist/project container we see — including
+          // clipless listings — so ids can be resolved to names later.
+          const containers = findPlaylists(data);
+          for (const pl of containers) {
+            if (pl.name || !knownPlaylists.has(pl.id)) knownPlaylists.set(pl.id, pl.name || '');
+          }
+
           const raw = findSongs(data);
           if (!raw.length) return;
 
-          // Map song id → playlist it appeared under (if any)
+          // Direct attribution: song found inside a playlist/project container.
+          // /api/project/default is the whole library, not a user collection —
+          // attributing it would tag every library song with noise.
+          const isLibraryFeed = /\/api\/project\/default\b/.test(url);
           const playlistOf = new Map();
-          for (const pl of findPlaylists(data)) {
+          for (const pl of isLibraryFeed ? [] : containers) {
             for (const entry of pl.clips) {
               const clip = entry && (entry.clip || entry);
               if (clip && clip.id) playlistOf.set(clip.id, { id: pl.id, name: pl.name });
             }
           }
 
+          // Context attribution: songs with no wrapping container (e.g.
+          // /api/unified/feed serving a playlist page). Attribute the whole
+          // response to a playlist if the REQUEST references a known playlist
+          // id, or we're on a /playlist/<uuid> page and this is a feed call.
+          let ctxPl = null;
+          if (!playlistOf.size && !isLibraryFeed) {
+            const reqText = await reqTextPromise;
+            const hay = url + ' ' + (reqText || '');
+            for (const [pid, pname] of knownPlaylists) {
+              if (pid && hay.includes(pid)) { ctxPl = { id: pid, name: pname }; break; }
+            }
+            if (!ctxPl) {
+              const m = location.pathname.match(/^\/playlist\/([0-9a-f-]{36})/i);
+              if (m && (hay.includes(m[1]) || /\/api\/unified\/feed/.test(url))) {
+                ctxPl = { id: m[1], name: knownPlaylists.get(m[1]) || '' };
+              }
+            }
+          }
+
           const newSongs = [];
           for (const r of raw) {
             if (!r.id) continue;
-            const pl = playlistOf.get(r.id) || null;
+            const pl = playlistOf.get(r.id) || ctxPl;
             const key = r.id + '|' + (pl ? pl.id : '');
             if (sentKeys.has(key)) continue;
             sentKeys.add(key);
