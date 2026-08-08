@@ -10,11 +10,8 @@ Download your entire Suno music library as a local ZIP. No cloud accounts, no co
 
 ## Install
 
-1. Download the correct .Zip
-   - Chrome: https://github.com/antra-tess/Suno-Archive-Manager/raw/refs/heads/main/dist/archive-master-chrome.zip
-   - Firefox: https://github.com/antra-tess/Suno-Archive-Manager/raw/refs/heads/main/dist/archive-master-firefox.zip
-2. Install/load into Browser (See instructions below for loading).
-
+1. Clone the repo
+   
 ## Build
 
 ```bash
