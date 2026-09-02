@@ -16,6 +16,10 @@ window.addEventListener('message', (e) => {
     chrome.runtime.sendMessage({ type: 'ADD_SONGS', songs: e.data.songs }).catch(() => {});
   } else if (type === 'SCROLL_COMPLETE') {
     chrome.runtime.sendMessage({ type: 'SCROLL_COMPLETE' }).catch(() => {});
+  } else if (type === 'AUTH') {
+    chrome.runtime.sendMessage({
+      type: 'AUTH_TOKEN', origin: e.data.origin, headers: e.data.headers,
+    }).catch(() => {});
   }
 });
 

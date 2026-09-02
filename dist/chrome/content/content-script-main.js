@@ -21,10 +21,22 @@
   const knownPlaylists = new Map();
 
   // ── Helpers ──────────────────────────────────────────────────────────────
+  // Newer Suno clips may carry a `media_urls` array instead of (or alongside)
+  // a plain `audio_url`. Items look like { encoding, delivery, content_type,
+  // url } — a falsy `encoding` means unencrypted; prefer progressive delivery
+  // (a directly fetchable file, not a streaming pipe).
+  function bestMediaUrl(raw) {
+    const items = Array.isArray(raw.media_urls) ? raw.media_urls : [];
+    const plain = items.filter(i => i && i.url && !i.encoding);
+    const prog  = plain.find(i => i.delivery === 'progressive');
+    return (prog || plain[0] || {}).url || '';
+  }
+
   function findSongs(obj) {
     let found = [];
     if (!obj || typeof obj !== 'object') return found;
-    if (obj.id && (obj.audio_url || obj.metadata?.audio_url)) return [obj];
+    if (obj.id && (obj.audio_url || obj.metadata?.audio_url ||
+        (Array.isArray(obj.media_urls) && obj.media_urls.length))) return [obj];
     if (Array.isArray(obj)) {
       obj.forEach(i => { found = found.concat(findSongs(i)); });
     } else {
@@ -61,7 +73,7 @@
     return {
       id:           raw.id,
       title:        raw.title || 'Untitled',
-      audio_url:    raw.audio_url  || raw.metadata?.audio_url  || '',
+      audio_url:    raw.audio_url  || raw.metadata?.audio_url  || bestMediaUrl(raw),
       image_url:    raw.image_url  || raw.image_large_url || raw.metadata?.image_url || '',
       tags:         raw.metadata?.tags   || raw.tags   || '',
       prompt:       raw.metadata?.prompt || raw.prompt || '',
@@ -88,6 +100,38 @@
     window.postMessage({ __am: true, ...msg }, '*');
   }
 
+  // ── Auth capture ─────────────────────────────────────────────────────────
+  // Suno's API rejects bare requests (403 → /api/forbidden): besides the
+  // short-lived Bearer token it wants Device-Id / Browser-Token etc. Rather
+  // than reconstruct that set, snapshot the COMPLETE headers of real outgoing
+  // API requests (plus the API origin) and let the export path replay them.
+  let lastToken = '';
+  function headersToObject(h) {
+    const out = {};
+    if (!h) return out;
+    if (typeof h.forEach === 'function' && typeof h.get === 'function') {
+      h.forEach((v, k) => { out[k] = v; });               // Headers instance
+    } else if (Array.isArray(h)) {
+      h.forEach(p => { if (p && p[0]) out[p[0]] = p[1]; });
+    } else if (typeof h === 'object') {
+      Object.keys(h).forEach(k => { out[k] = h[k]; });
+    }
+    return out;
+  }
+  function captureAuth(url, resource, init) {
+    try {
+      const fromInit = headersToObject(init && init.headers);
+      const fromReq  = resource instanceof Request ? headersToObject(resource.headers) : {};
+      const headers  = { ...fromReq, ...fromInit };
+      const authKey  = Object.keys(headers).find(k => /^authorization$/i.test(k));
+      const m = /^Bearer\s+(.+)$/i.exec(authKey ? headers[authKey] : '');
+      if (m && m[1] !== lastToken) {
+        lastToken = m[1];
+        toExt({ type: 'AUTH', origin: new URL(url).origin, headers });
+      }
+    } catch (e) { /* never break the request */ }
+  }
+
   // Updated whenever new songs arrive — adaptive scroll watches this
   let lastSongArrival = 0;
 
@@ -102,6 +146,8 @@
       if (/(statsig|segment|stratovibe|sentry|rgstr|pixel)/i.test(url)) {
         return new Response('{}', { status: 200 });
       }
+
+      if (/\/api\//.test(url)) captureAuth(url, resource, init);
 
       // Snapshot the request body BEFORE the request is consumed — needed to
       // attribute container-less feed responses to the playlist they belong to.
@@ -128,9 +174,10 @@
           if (!raw.length) return;
 
           // Direct attribution: song found inside a playlist/project container.
-          // /api/project/default is the whole library, not a user collection —
-          // attributing it would tag every library song with noise.
-          const isLibraryFeed = /\/api\/project\/default\b/.test(url);
+          // /api/project/default (legacy) and /api/project/feed (current) are
+          // the whole library, not a user collection — attributing them would
+          // tag every library song with noise.
+          const isLibraryFeed = /\/api\/project\/(default\b|feed\b)/.test(url);
           const playlistOf = new Map();
           for (const pl of isLibraryFeed ? [] : containers) {
             for (const entry of pl.clips) {

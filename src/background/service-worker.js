@@ -8,6 +8,7 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => 
 
 
 const SESSION_KEY = 'archiveSongs';
+const AUTH_KEY    = 'archiveAuthToken';
 
 // ── Storage helpers ────────────────────────────────────────────────────────
 async function getSongs() {
@@ -81,6 +82,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           updateBadge(existing.length);
         }
         sendResponse({ ok: true });
+
+      } else if (msg.type === 'AUTH_TOKEN') {
+        // Latest full API request context (origin + headers incl. Bearer,
+        // Device-Id, Browser-Token…), snooped by the content script. The
+        // token is short-lived — always overwrite with the freshest.
+        await chrome.storage.session.set({
+          [AUTH_KEY]: { origin: msg.origin, headers: msg.headers || {} },
+        });
+        sendResponse({ ok: true });
+
+      } else if (msg.type === 'GET_AUTH') {
+        // Offscreen asks right before each download resolution, so a long
+        // export keeps picking up fresh credentials as the page renews them.
+        const r = await chrome.storage.session.get(AUTH_KEY);
+        sendResponse({ auth: r[AUTH_KEY] || null });
 
       } else if (msg.type === 'GET_SONGS') {
         const songs = await getSongs();

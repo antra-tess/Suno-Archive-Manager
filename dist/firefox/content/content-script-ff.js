@@ -14,10 +14,22 @@ const pageScript = `
     return (name || 'untitled').replace(/[^a-z0-9]/gi, '_').toLowerCase();
   }
 
+  // Newer Suno clips may carry a media_urls array ({encoding, delivery,
+  // content_type, url}) instead of a plain audio_url. Falsy encoding =
+  // unencrypted; prefer progressive delivery (directly fetchable file).
+  function bestMediaUrl(raw) {
+    var items = Array.isArray(raw.media_urls) ? raw.media_urls : [];
+    var plain = items.filter(function(i) { return i && i.url && !i.encoding; });
+    var prog = null;
+    plain.forEach(function(i) { if (!prog && i.delivery === 'progressive') prog = i; });
+    return ((prog || plain[0]) || {}).url || '';
+  }
+
   function findSongs(obj) {
     let found = [];
     if (!obj || typeof obj !== 'object') return found;
-    if (obj.id && (obj.audio_url || (obj.metadata && obj.metadata.audio_url))) return [obj];
+    if (obj.id && (obj.audio_url || (obj.metadata && obj.metadata.audio_url) ||
+        (Array.isArray(obj.media_urls) && obj.media_urls.length))) return [obj];
     if (Array.isArray(obj)) {
       obj.forEach(function(i) { found = found.concat(findSongs(i)); });
     } else {
@@ -49,7 +61,7 @@ const pageScript = `
   }
 
   function normalizeSong(raw) {
-    var audioUrl = raw.audio_url || (raw.metadata && raw.metadata.audio_url) || '';
+    var audioUrl = raw.audio_url || (raw.metadata && raw.metadata.audio_url) || bestMediaUrl(raw);
     var imageUrl = raw.image_url || raw.image_large_url || (raw.metadata && raw.metadata.image_url) || '';
     return {
       id: raw.id,
@@ -98,6 +110,42 @@ const pageScript = `
   // wrapper again and again, stacking one layer per navigation.
   var trueFetch = window.fetch;
 
+  // Snapshot the COMPLETE headers + origin of real outgoing API requests —
+  // the WAF rejects bare requests (403 → /api/forbidden), so the background
+  // page replays the full set (Bearer, Device-Id, Browser-Token, …).
+  var lastToken = '';
+  function headersToObject(h) {
+    var out = {};
+    if (!h) return out;
+    if (typeof h.forEach === 'function' && typeof h.get === 'function') {
+      h.forEach(function(v, k) { out[k] = v; });
+    } else if (Array.isArray(h)) {
+      h.forEach(function(p) { if (p && p[0]) out[p[0]] = p[1]; });
+    } else if (typeof h === 'object') {
+      Object.keys(h).forEach(function(k) { out[k] = h[k]; });
+    }
+    return out;
+  }
+  function captureAuth(url, resource, init) {
+    try {
+      var headers = {};
+      if (resource instanceof Request) headers = headersToObject(resource.headers);
+      var fromInit = headersToObject(init && init.headers);
+      Object.keys(fromInit).forEach(function(k) { headers[k] = fromInit[k]; });
+      var authVal = '';
+      Object.keys(headers).forEach(function(k) {
+        if (!authVal && /^authorization$/i.test(k)) authVal = headers[k];
+      });
+      var m = /^Bearer\\s+(.+)$/i.exec(authVal || '');
+      if (m && m[1] !== lastToken) {
+        lastToken = m[1];
+        window.dispatchEvent(new CustomEvent('__AM_AUTH__', {
+          detail: JSON.stringify({ origin: new URL(url).origin, headers: headers })
+        }));
+      }
+    } catch (e) {}
+  }
+
   function attachInterceptor() {
     var originalFetch = trueFetch;
     window.fetch = function() {
@@ -109,6 +157,8 @@ const pageScript = `
       if (/(statsig|segment|stratovibe|sentry|rgstr|pixel)/i.test(url)) {
         return Promise.resolve(new Response('{}', { status: 200 }));
       }
+
+      if (/\\/api\\//.test(url)) captureAuth(url, resource, init);
 
       // Snapshot the request body BEFORE it's consumed — used to attribute
       // container-less feed responses to the playlist they belong to.
@@ -135,8 +185,9 @@ const pageScript = `
           if (raw.length === 0) return;
 
           // Direct attribution: songs inside a container.
-          // /api/project/default is the whole library, not a user collection.
-          var isLibraryFeed = /\/api\/project\/default\b/.test(url);
+          // /api/project/default (legacy) and /api/project/feed (current) are
+          // the whole library, not a user collection.
+          var isLibraryFeed = /\\/api\\/project\\/(default\\b|feed\\b)/.test(url);
           var playlistOf = new Map();
           (isLibraryFeed ? [] : containers).forEach(function(pl) {
             pl.clips.forEach(function(entry) {
@@ -155,8 +206,8 @@ const pageScript = `
                 if (!ctxPl && pid && hay.indexOf(pid) !== -1) ctxPl = { id: pid, name: pname };
               });
               if (!ctxPl) {
-                var m = location.pathname.match(/^\/playlist\/([0-9a-f-]{36})/i);
-                if (m && (hay.indexOf(m[1]) !== -1 || /\/api\/unified\/feed/.test(url))) {
+                var m = location.pathname.match(/^\\/playlist\\/([0-9a-f-]{36})/i);
+                if (m && (hay.indexOf(m[1]) !== -1 || /\\/api\\/unified\\/feed/.test(url))) {
                   ctxPl = { id: m[1], name: knownPlaylists.get(m[1]) || '' };
                 }
               }
@@ -232,6 +283,15 @@ window.addEventListener('__AM_SONGS__', (e) => {
 
 window.addEventListener('__AM_SCROLL_DONE__', () => {
   browser.runtime.sendMessage({ type: 'SCROLL_COMPLETE' }).catch(() => {});
+});
+
+window.addEventListener('__AM_AUTH__', (e) => {
+  try {
+    const auth = JSON.parse(e.detail);
+    browser.runtime.sendMessage({
+      type: 'AUTH_TOKEN', origin: auth.origin, headers: auth.headers,
+    }).catch(() => {});
+  } catch (_) {}
 });
 
 // ── Bridge: background → page ─────────────────────────────────────────────
